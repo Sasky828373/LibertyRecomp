@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -28,6 +29,7 @@
 #include <rex/system/util/xex2_info.h>
 #include <rex/system/xcontent.h>
 #include <rex/system/xtypes.h>
+#include <xxhash.h>
 
 #include "TinySHA1.hpp"
 #include "gta4_rpf_extractor.h"
@@ -43,6 +45,7 @@ using namespace rex::literals;
 
 constexpr uint32_t kGta4TitleId = 0x545407F2;
 constexpr uint32_t kRequiredTargetVersion = 0x00000805;
+constexpr uint64_t kRequiredBaseXexXxh3 = 2823947441600373906ULL;
 constexpr std::string_view kRequiredPatchSha256 =
     "480aee5e2b42707791e7571bb8407c5bb3f6c7534f07f9beb426db4cfc648fd3";
 constexpr std::string_view kEmbeddedTargetXexSha256 =
@@ -393,7 +396,7 @@ std::optional<MountedSource> MountSource(const std::filesystem::path& path, std:
 
   MountedSource source;
   source.package_title_id = header->metadata.execution_info.title_id;
-  source.device = std::make_unique<rex::filesystem::StfsContainerDevice>("install:", path);
+  source.device = std::make_unique<rex::filesystem::StfsContainerDevice>("install:", path, false);
   if (!source.device->Initialize()) {
     error = "The Xbox content package is corrupt or unsupported.";
     return std::nullopt;
@@ -622,6 +625,11 @@ std::optional<PreparedSource> PrepareGameSource(const std::filesystem::path& pat
   if (!ReadEntryBytes(source.xex.entry, source.xex_bytes, error) ||
       !ParseXex(source.xex_bytes, source.xex_info, error) ||
       !ValidateBaseXex(source.xex_info, error)) {
+    return std::nullopt;
+  }
+  const GameSourceInspection inspection = InspectGameXex(source.xex_bytes);
+  if (!inspection.supported()) {
+    error = inspection.rejection_reason;
     return std::nullopt;
   }
   if (source.mounted.package_title_id && *source.mounted.package_title_id != kGta4TitleId) {
@@ -858,6 +866,11 @@ bool ValidateInstalledPair(const std::filesystem::path& game_root, std::string& 
     return true;
   }
 
+  if (XXH3_64bits(base_bytes.data(), base_bytes.size()) != kRequiredBaseXexXxh3) {
+    reason = "default.xex does not match GTA IV USA retail 1.00.";
+    return false;
+  }
+
   const auto patch_path = game_root / "default.xexp";
   std::vector<uint8_t> patch_bytes;
   if (!ReadHostFile(patch_path, patch_bytes, reason)) {
@@ -908,12 +921,18 @@ Result VerifyInstall(const std::filesystem::path& game_root,
 
 Result Install(const Selection& selection, const std::filesystem::path& install_root,
                Progress& progress) {
+  try {
   Result result;
   progress.copied_bytes = 0;
   progress.total_bytes = 0;
 
   std::optional<PreparedSource> game;
   if (!selection.game_source.empty()) {
+    const GameSourceInspection inspection = InspectGameSource(selection.game_source);
+    if (!inspection.supported()) {
+      result.error = inspection.rejection_reason;
+      return result;
+    }
     game = PrepareGameSource(selection.game_source, result.error);
     if (!game) {
       return result;
@@ -935,15 +954,15 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
   }
 
   std::optional<PreparedUpdate> update;
-  if (game && !selection.update_source.empty()) {
+  if (game && selection.update_source.empty()) {
+    result.error = "The supported retail 1.00 source requires the GTA IV v8 title update.";
+    return result;
+  }
+  if (game) {
     update = PrepareUpdateSource(selection.update_source, game->xex_info, result.error);
     if (!update) {
       return result;
     }
-  } else if (game && (game->xex_info.version != kRequiredTargetVersion ||
-                      HashBytes(game->xex_bytes) != kEmbeddedTargetXexSha256)) {
-    result.error = "The retail GTA IV source requires the v8 title update package.";
-    return result;
   }
 
   std::vector<PreparedDlc> dlc;
@@ -1025,6 +1044,13 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
   if (game && !CopyTree(game->payload_root, staged_game, progress, result.error)) {
     return fail(std::move(result.error));
   }
+  if (game) {
+    const GameSourceInspection staged_inspection = InspectGameSource(staged_game);
+    if (!staged_inspection.supported()) {
+      return fail("The copied base game no longer matches the selected retail 1.00 source: " +
+                  staged_inspection.rejection_reason);
+    }
+  }
 
   if (update) {
     if (!update->raw_patch) {
@@ -1099,6 +1125,13 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
   std::filesystem::remove_all(staging_root, fs_error);
   result.success = true;
   return result;
+  } catch (const std::filesystem::filesystem_error& exception) {
+    return Result{false, "The selected source changed or became unreadable during installation: " +
+                             std::string(exception.what())};
+  } catch (const std::exception& exception) {
+    return Result{false, "The selected Xbox content package is malformed: " +
+                             std::string(exception.what())};
+  }
 }
 
 }  // namespace gta4::install

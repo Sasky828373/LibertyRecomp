@@ -336,16 +336,13 @@ else()
     set(LIBERTY_RECOMP_HID_CXX_SOURCES
         "hid/hid.cpp"
         "hid/mouse_camera.cpp"
-        "hid/dualsense.cpp"
         "hid/driver/sdl_hid.cpp"
     )
 endif()
 
 set(LIBERTY_RECOMP_PATCHES_CXX_SOURCES
-    # Input
-    "patches/gta4_input_patches.cpp"         # GTA IV input remapping
+    # Input (GTA IV keyboard/mouse remapping moved to the active RexGlue target.)
     "patches/gta4_motion_patches.cpp"        # GTA IV motion (PlayStation gyro/accel)
-    "patches/gta4_ds4_patches.cpp"           # DualShock 4/DualSense features
 
     # High-frame-rate corrections verified against GTA IV Xbox 360 PPC
     "patches/gta4_fps_camera_shake_fix.cpp"
@@ -567,9 +564,11 @@ if (WIN32)
     )
 
     # Set Win32 icon path.
-    set(WIN32_ICON_PATH "${PROJECT_SOURCE_DIR}/../LibertyRecompResources/images/game_icon.ico")
+    set(WIN32_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/res/icons/game_icon.ico")
 
     configure_file("res/win32/res.rc.template" "${CMAKE_BINARY_DIR}/res.rc" @ONLY)
+    set_source_files_properties("${CMAKE_BINARY_DIR}/res.rc" PROPERTIES
+        OBJECT_DEPENDS "${WIN32_ICON_PATH}")
     add_executable(LibertyRecomp ${LIBERTY_RECOMP_CXX_SOURCES} "${CMAKE_BINARY_DIR}/res.rc")
 
     # Hide console for release configurations.
@@ -1666,6 +1665,57 @@ if(USE_REXGLUE_RUNTIME)
         rex::kernel
         rex::audio
     )
+    if(NOT LIBERTY_RECOMP_PS4)
+        set(LIBERTY_TOUCH_SOURCE_ROOT
+            "${CMAKE_CURRENT_SOURCE_DIR}/../glue/rexglue-sdk-main/gta4-recomp/src")
+        set(LIBERTY_TOUCH_SHARED_SOURCES
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/gta4_touch_coordinator.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/gta4_touch_guest_hooks.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_context.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_camera_hooks.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_controls.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_layout.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_draw.cpp"
+            "${LIBERTY_TOUCH_SOURCE_ROOT}/input/context_touch_settings.cpp")
+        target_sources(LibertyRecomp PRIVATE ${LIBERTY_TOUCH_SHARED_SOURCES}
+            hid/context_touch_host.cpp gpu/context_touch_renderer.cpp)
+        set_source_files_properties(${LIBERTY_TOUCH_SHARED_SOURCES}
+            hid/context_touch_host.cpp gpu/context_touch_renderer.cpp
+            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+        if(LIBERTY_RECOMP_NX)
+            set_property(SOURCE "${LIBERTY_TOUCH_SOURCE_ROOT}/gta4_touch_guest_hooks.cpp"
+                APPEND PROPERTY COMPILE_DEFINITIONS GTA4_TOUCH_STANDALONE_POLL_OWNER)
+        endif()
+        target_include_directories(LibertyRecomp PRIVATE
+            "${LIBERTY_TOUCH_SOURCE_ROOT}" "${LIBERTY_TOUCH_SOURCE_ROOT}/../generated")
+        target_compile_definitions(LibertyRecomp PRIVATE GTA4_TOUCH_LEGACY_HOST)
+        # ImGui 1.91's allocation diagnostics mutate the menu's global context
+        # even for a private ImDrawList. Gameplay uses a render-worker draw list;
+        # disable that optional instrumentation consistently for the legacy ABI.
+        target_compile_definitions(LibertyRecomp PRIVATE IMGUI_DISABLE_DEBUG_TOOLS)
+        target_link_libraries(LibertyRecomp PRIVATE rex::input)
+    endif()
+    if(NOT (LIBERTY_RECOMP_PS4 OR LIBERTY_RECOMP_NX))
+        set(LIBERTY_SONY_SOURCE_ROOT
+            "${CMAKE_CURRENT_SOURCE_DIR}/../glue/rexglue-sdk-main/gta4-recomp/src")
+        target_sources(LibertyRecomp PRIVATE
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_feedback.cpp"
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_event_hooks.cpp"
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_legacy_hooks.cpp")
+        target_include_directories(LibertyRecomp PRIVATE
+            "${LIBERTY_SONY_SOURCE_ROOT}/../generated")
+        set_source_files_properties(
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_feedback.cpp"
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_event_hooks.cpp"
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_legacy_hooks.cpp"
+            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+        set_source_files_properties(
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_feedback.cpp"
+            "${LIBERTY_SONY_SOURCE_ROOT}/gta4_sony_legacy_hooks.cpp"
+            PROPERTIES COMPILE_DEFINITIONS GTA4_SONY_LEGACY_HOST)
+        target_link_libraries(LibertyRecomp PRIVATE rex::input)
+        target_compile_definitions(LibertyRecomp PRIVATE GTA4_SONY_LEGACY_OWNER)
+    endif()
 endif()
 
 # Link abseil libraries for GameNetworkingSockets (protobuf dependency)
@@ -1891,7 +1941,27 @@ BIN2C(TARGET_OBJ LibertyRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/images/inst
 endif()
 
 ## Game Icon ##
-BIN2C(TARGET_OBJ LibertyRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/images/game_icon.bmp" DEST_FILE "${RESOURCES_OUTPUT_PATH}/images/game_icon.bmp" ARRAY_NAME "g_game_icon")
+if(LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
+    # Desktop branding is checked in and does not depend on the optional
+    # external resource archive. Keep generated C/header files in the build tree.
+    set(LIBERTY_DESKTOP_ICON_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${LIBERTY_DESKTOP_ICON_GENERATED}/res/icons")
+    BIN2C(TARGET_OBJ LibertyRecomp
+        SOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/res/icons/game_icon.bmp"
+        DEST_FILE "${LIBERTY_DESKTOP_ICON_GENERATED}/res/icons/desktop_icon.bmp"
+        ARRAY_NAME "g_desktop_app_icon")
+    target_include_directories(LibertyRecomp PRIVATE "${LIBERTY_DESKTOP_ICON_GENERATED}")
+    target_compile_definitions(LibertyRecomp PRIVATE LIBERTY_RECOMP_DESKTOP_ICON)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        include("${CMAKE_SOURCE_DIR}/cmake/LinuxDesktopIntegration.cmake")
+        liberty_configure_linux_desktop(LibertyRecomp "${CMAKE_CURRENT_SOURCE_DIR}/res")
+    elseif(APPLE)
+        set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/res/macos/game_icon.icns")
+    endif()
+else()
+    BIN2C(TARGET_OBJ LibertyRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/images/game_icon.bmp" DEST_FILE "${RESOURCES_OUTPUT_PATH}/images/game_icon.bmp" ARRAY_NAME "g_game_icon")
+endif()
 
 ## Button Prompts (Controller-specific XTD files) ##
 set(BUTTON_PROMPTS_SOURCE "${PROJECT_SOURCE_DIR}/../LibertyRecompLib/private/button_prompts")

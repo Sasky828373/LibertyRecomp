@@ -66,14 +66,28 @@ class VulkanDevice {
     uint32_t maxPerStageDescriptorStorageBuffers = 4;
     uint32_t maxPerStageDescriptorSampledImages = 16;
     uint32_t maxPerStageResources = 128;
+    uint32_t maxDescriptorSetSamplers = 96;
+    uint32_t maxDescriptorSetSampledImages = 96;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+    uint32_t maxPerStageUpdateAfterBindResources = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSamplers = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSampledImages = 0;
     uint32_t maxVertexOutputComponents = 64;
+    uint32_t maxVertexInputBindings = 16;
+    uint32_t maxVertexInputAttributes = 16;
+    uint32_t maxVertexInputBindingStride = 2048;
+    uint32_t maxVertexInputAttributeOffset = 2047;
     uint32_t maxTessellationEvaluationOutputComponents = 64;
     uint32_t maxGeometryInputComponents = 64;
     uint32_t maxGeometryOutputComponents = 64;
     uint32_t maxFragmentInputComponents = 64;
     uint32_t maxFragmentCombinedOutputResources = 4;
     float maxSamplerAnisotropy = 1.0f;
+    float maxSamplerLodBias = 0.0f;
     uint32_t maxViewportDimensions[2] = {4096, 4096};
+    float viewportBoundsRange[2] = {-32768.0f, 32767.0f};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
     VkDeviceSize minStorageBufferOffsetAlignment = 256;
     uint32_t maxFramebufferWidth = 4096;
@@ -103,6 +117,7 @@ class VulkanDevice {
     bool tessellationShader = false;
     bool sampleRateShading = false;
     bool depthClamp = false;
+    bool depthClipControl = false;
     bool fillModeNonSolid = false;
     bool samplerAnisotropy = false;
     bool occlusionQueryPrecise = false;
@@ -117,6 +132,10 @@ class VulkanDevice {
     // Vulkan 1.2 features used by Liberty's precompiled native shader cache.
     bool runtimeDescriptorArray = false;
     bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingSamplerUpdateAfterBind = false;
+    bool descriptorBindingUpdateUnusedWhilePending = false;
+    bool descriptorBindingVariableDescriptorCount = false;
     bool bufferDeviceAddress = false;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
@@ -133,9 +152,14 @@ class VulkanDevice {
 
     // VK_KHR_portability_subset (#164)
 
+    bool portabilitySubset = false;
     bool constantAlphaColorBlendFactors = false;
     bool imageViewFormatReinterpretation = false;
     bool imageViewFormatSwizzle = false;
+    bool samplerMipLodBias = false;
+    bool triangleFans = false;
+    bool vertexAttributeAccessBeyondStride = false;
+    uint32_t minVertexInputBindingStrideAlignment = 1;
     bool pointPolygons = false;
     bool separateStencilMaskRef = false;
     bool shaderSampleRateInterpolationFunctions = false;
@@ -189,6 +213,7 @@ class VulkanDevice {
   // the Vulkan API they were promoted to it supported (with the
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
+    bool ext_GOOGLE_display_timing = false;
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
@@ -199,7 +224,8 @@ class VulkanDevice {
     bool ext_1_1_KHR_bind_memory2 = false;              // #158
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
-    // Has optional features not implied by this being true.
+    // Has optional features not implied by these being true.
+    bool ext_EXT_depth_clip_control = false;
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
     bool ext_EXT_robustness2 = false;
@@ -214,6 +240,8 @@ class VulkanDevice {
   VkDevice device() const { return device_; }
 
   struct Functions {
+    PFN_vkGetRefreshCycleDurationGOOGLE vkGetRefreshCycleDurationGOOGLE = nullptr;
+    PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE = nullptr;
 #define XE_UI_VULKAN_FUNCTION(name) PFN_##name name = nullptr;
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
   PFN_##core_name core_name = nullptr;

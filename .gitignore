@@ -656,6 +656,7 @@ docs/*.md
 !docs/SHADER_PIPELINE.md
 !docs/RPF_EXTRACTION_DESIGN.md
 !docs/GTA4_COLLISION_VPKUWUS_ALIASING_FIX.md
+!docs/GTA_IV_ASSET_STREAMING_SYSTEM.md
 -e 
 # Claude and GitHub metadata - do not commit
 .claude/
@@ -672,9 +673,32 @@ build-codegen/
 *.sh
 *.py
 /tools/*.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_draw_distance_hooks.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_frontend_advanced_menu_layout.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/verify_gta4_keyboard_consumers.py
+!tools/analyze_native_memory.py
+!tools/test_analyze_native_memory.py
+!tools/validate_shader_preservation.py
+!tools/test_validate_shader_preservation.py
+!tools/recover_shader_sources.py
+!tools/test_recover_shader_sources.py
+!docs/NATIVE_MEMORY_PROFILING.md
+!glue/rexglue-sdk-main/community-server/deploy/backup.sh
 !tools/xtd_tools/button_prompt_roundtrip.py
 !LibertyRecompLib/font_atlases/tools/*.py
 !glue/rexglue-sdk-main/gta4-recomp/tools/verify_physics_trace_sites.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_player_info_table.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_gameplay_player_width.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_gameplay_multiplayer_surfaces.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_player_info_64_layout.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_multiplayer_64_consumers.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_multiplayer_peer_width.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_online_services_abi.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_session_search_authority.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_reassignment_consumers.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_voice_receive_pipeline.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_community_client_limits.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_multiplayer_64_layout.py
 !glue/rexglue-sdk-main/tools/gta4_shader_override_compiler.py
 *.pid
 chat_summary*.txt
@@ -688,3 +712,52 @@ run.pid
 
 # Scripts
 scripts/
+
+# Execution captures, investigation reports, and local server state are not source.
+/captures/
+/reports/
+/libserver/runtime/data/state.json
+!tools/test_dependency_patches.py
+!tools/validate_shader_cache_candidate.py
+
+# Reproducible community-server regression runners.
+!/libserver/tests/server_reliability_regression_test.py
+!/libserver/tests/deferred_tls_regression_test.py
+!/glue/rexglue-sdk-main/tests/regression/run_community_backend_integration.py
+
+# Reproducible desktop application icon generation and verification.
+!tools/generate_desktop_icons.py
+!tools/test_desktop_icons.py
+!tools/generate_mobile_icons.py
+!tools/verify_macos_bundle.py
+
+# Reproducible audio regression tools (not disposable research scripts).
+!/tools/run_xma_audio_regressions.py
+!/tools/extract_xma_loop_fixtures.py
+!/tools/generate_xma_loop_cases.py
+
+# Sony controller feature documentation and reproducible regression tools.
+!/docs/SONY_CONTROLLER_FEATURES.md
+!/glue/rexglue-sdk-main/tools/run_sony_feedback_tests.py
+!/glue/rexglue-sdk-main/gta4-recomp/tools/verify_gta4_sony_sites.py
+
+# Repository setup and validation are maintained source, not local scripts.
+!/tools/setup_repo.py
+!/tools/test_setup_repo.py
+!/update_submodules.sh
+/CMakeFiles/
+/glue/rexglue-sdk-main/CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+/.github/*
+!/.github/
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/repository-checks.yml
+!/.github/workflows/build-macos.yml
+
+# Reproducible touch regression runner and arithmetic fixtures.
+!/glue/rexglue-sdk-main/tools/verify_controls_regressions.py
+!/glue/rexglue-sdk-main/tests/regression/controls/touch_samples.py
+!/glue/rexglue-sdk-main/tests/regression/controls/touch_icon_samples.py
+!/glue/rexglue-sdk-main/tests/regression/touch_frontend_activation_runtime_test.py

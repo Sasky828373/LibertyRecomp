@@ -14,6 +14,7 @@
 #include <rex/ui/window_sdl.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 
@@ -22,6 +23,8 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/video_mode_util.h>
+#include <rex/input/input_trace.h>
+#include <rex/input/absolute_pointer.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
@@ -32,8 +35,13 @@
 #elif REX_PLATFORM_MAC
 #include <SDL3/SDL_metal.h>
 #include <rex/ui/surface_mac.h>
+#if !REX_PLATFORM_IOS
 #include "accelerated_pointer_mac.h"
-#else
+#include "sdl_mouse_motion_policy.h"
+#endif
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
+#elif REX_PLATFORM_GNU_LINUX
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
 #endif
@@ -41,6 +49,26 @@
 namespace rex::ui {
 
 namespace {
+
+constexpr Uint32 kDeferredPaintDelayMs = 1;
+
+struct DeferredPaintRequest {
+  uint32_t event_type;
+  SDL_WindowID window_id;
+  uint32_t ticket;
+  std::shared_ptr<PaintWakeupState> state;
+};
+
+Uint64 DeferredPaintTimerCallback(void* userdata, SDL_TimerID, Uint64) {
+  std::unique_ptr<DeferredPaintRequest> request(static_cast<DeferredPaintRequest*>(userdata));
+  if (!request->state->IsCurrent(request->ticket)) return 0;
+  SDL_Event event{};
+  event.type = request->event_type;
+  event.user.windowID = request->window_id;
+  event.user.code = static_cast<Sint32>(request->ticket);
+  if (!SDL_PushEvent(&event)) request->state->Complete(request->ticket);
+  return 0;
+}
 
 uint32_t ResolveWindowWidth(uint32_t requested_width) {
   if (REXCVAR_GET(window_width) > 0) {
@@ -132,6 +160,7 @@ WindowSDL::~WindowSDL() {
 }
 
 bool WindowSDL::OpenImpl() {
+  paint_wakeup_ = std::make_shared<PaintWakeupState>();
   // SDL window coordinates are physical pixels on Windows and X11.
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
 #if REX_PLATFORM_MAC
@@ -197,6 +226,7 @@ bool WindowSDL::OpenImpl() {
     REXLOG_WARN("SDL_SyncWindow timed out while entering fullscreen; continuing asynchronously");
   }
 
+
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
   int pixel_width = 0;
@@ -207,6 +237,7 @@ bool WindowSDL::OpenImpl() {
   if (destruction_receiver.IsWindowDestroyed()) {
     return true;
   }
+  RefreshPhysicalSafeArea();
   if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_INPUT_FOCUS) {
     OnFocusUpdate(true, destruction_receiver);
   }
@@ -228,15 +259,18 @@ void WindowSDL::PerformClose() {
 }
 
 void WindowSDL::DestroySDLWindow() {
+  paint_wakeup_->Stop();
   if (cursor_hide_timer_) {
     SDL_RemoveTimer(cursor_hide_timer_);
     cursor_hide_timer_ = 0;
   }
 #if REX_PLATFORM_MAC
+#if !REX_PLATFORM_IOS
   if (accelerated_pointer_monitor_) {
     RemoveAcceleratedPointerMonitor(accelerated_pointer_monitor_);
     accelerated_pointer_monitor_ = nullptr;
   }
+#endif
   DestroyMetalView();
 #endif
   if (sdl_window_) {
@@ -270,6 +304,8 @@ void* WindowSDL::GetOrCreateMetalLayer() {
   void* layer = SDL_Metal_GetLayer(static_cast<SDL_MetalView>(sdl_metal_view_));
   if (!layer) {
     REXLOG_ERROR("SDL_Metal_GetLayer failed: {}", SDL_GetError());
+  } else {
+    ConfigureMetalLayerForPresentation(layer);
   }
   return layer;
 }
@@ -284,7 +320,14 @@ void* WindowSDL::GetNativeWindowHandle() const {
                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
 #elif REX_PLATFORM_MAC
   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+#if REX_PLATFORM_IOS
+                                SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+#else
                                 SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+#endif
+#elif REX_PLATFORM_ANDROID
+  return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+                                SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
 #else
   return nullptr;
 #endif
@@ -352,7 +395,7 @@ bool WindowSDL::SetRelativeMouseMode(bool enabled) {
           return;
         }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
         if (!enabled && accelerated_pointer_monitor_) {
           RemoveAcceleratedPointerMonitor(accelerated_pointer_monitor_);
           accelerated_pointer_monitor_ = nullptr;
@@ -365,7 +408,7 @@ bool WindowSDL::SetRelativeMouseMode(bool enabled) {
           return;
         }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
         if (enabled && !accelerated_pointer_monitor_) {
           accelerated_pointer_monitor_ = InstallAcceleratedPointerMonitor(
               GetNativeWindowHandle(), &WindowSDL::AcceleratedPointerCallbackThunk, this);
@@ -449,7 +492,12 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       return std::make_unique<CAMetalLayerSurface>(sdl_window_, layer);
     }
   }
-#else
+#elif REX_PLATFORM_ANDROID
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    auto* native_window = static_cast<ANativeWindow*>(GetNativeWindowHandle());
+    if (native_window) return std::make_unique<AndroidNativeWindowSurface>(native_window);
+  }
+#elif REX_PLATFORM_GNU_LINUX
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
     auto* display = static_cast<Display*>(
@@ -465,28 +513,64 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
 }
 
 void WindowSDL::RequestPaintImpl() {
-  // Coalesce: at most one queued paint event at a time. Callable from non-UI
-  // threads; SDL_PushEvent is thread-safe.
-  if (paint_pending_.exchange(true, std::memory_order_acq_rel)) {
-    return;
-  }
+  const uint32_t ticket = paint_wakeup_->Request(SDL_GetTicksNS());
+  if (!ticket) return;
   SDL_Event event{};
   event.type = sdl_app_context().paint_event_type();
   event.user.windowID = sdl_window_id_;
-  SDL_PushEvent(&event);
+  event.user.code = static_cast<Sint32>(ticket);
+  if (!SDL_PushEvent(&event)) paint_wakeup_->Complete(ticket);
 }
 
-void WindowSDL::HandlePaintEvent() {
-  paint_pending_.store(false, std::memory_order_release);
-  OnPaint();
+void WindowSDL::RequestPaintAtUITickImpl() {
+  RequestPaintAfterImpl(kDeferredPaintDelayMs);
+}
+
+void WindowSDL::RequestPaintAfterImpl(uint32_t delay_ms) {
+  RequestPaintAfterNanosecondsImpl(uint64_t(delay_ms) * 1'000'000);
+}
+
+void WindowSDL::RequestPaintAfterNanosecondsImpl(uint64_t delay_ns) {
+  delay_ns = std::clamp<uint64_t>(delay_ns, 1, 1'000'000'000);
+  const uint32_t ticket = paint_wakeup_->Request(SDL_GetTicksNS() + delay_ns);
+  if (!ticket) return;
+  auto request = std::make_unique<DeferredPaintRequest>(DeferredPaintRequest{
+      sdl_app_context().paint_event_type(), sdl_window_id_, ticket, paint_wakeup_});
+  if (!SDL_AddTimerNS(delay_ns, DeferredPaintTimerCallback, request.get())) {
+    paint_wakeup_->Complete(ticket);
+    REXLOG_WARN("SDL_AddTimerNS failed for paint scheduling: {}", SDL_GetError());
+    RequestPaintImpl();
+    return;
+  }
+  request.release();
+}
+
+void WindowSDL::HandlePaintEvent(uint32_t ticket) {
+  if (paint_wakeup_->Complete(ticket)) OnPaint();
 }
 
 void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+  switch (event.type) {
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+    case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+    case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+    case SDL_EVENT_WINDOW_SAFE_AREA_CHANGED:
+      rex::input::GetAbsolutePointerService().CancelAll(event.common.timestamp);
+      break;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+    case SDL_EVENT_WINDOW_HIDDEN:
+      rex::input::GetAbsolutePointerService().SetFocused(false, event.common.timestamp);
+      break;
+  }
   WindowDestructionReceiver destruction_receiver(this);
   switch (event.type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
       OnActualSizeUpdate(uint32_t(event.window.data1), uint32_t(event.window.data2),
                          destruction_receiver);
+      if (!destruction_receiver.IsWindowDestroyed()) {
+        RefreshPhysicalSafeArea();
+      }
       break;
     case SDL_EVENT_WINDOW_RESIZED: {
       // Track the user-driven size as the desired size for the normal state
@@ -496,18 +580,26 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
         OnDesiredLogicalSizeUpdate(SizeToLogical(uint32_t(event.window.data1)),
                                    SizeToLogical(uint32_t(event.window.data2)));
       }
+      RefreshPhysicalSafeArea();
       break;
     }
     case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
       UISetupEvent e(this);
       OnDpiChanged(e, destruction_receiver);
+      if (!destruction_receiver.IsWindowDestroyed()) {
+        RefreshPhysicalSafeArea();
+      }
       break;
     }
     case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
       MonitorUpdateEvent e(this, true);
       OnMonitorUpdate(e);
+      RefreshPhysicalSafeArea();
       break;
     }
+    case SDL_EVENT_WINDOW_SAFE_AREA_CHANGED:
+      RefreshPhysicalSafeArea();
+      break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
       OnFocusUpdate(true, destruction_receiver);
       break;
@@ -537,6 +629,44 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
   }
 }
 
+bool WindowSDL::GetPhysicalSafeArea(int32_t& x_out, int32_t& y_out, int32_t& width_out,
+                                    int32_t& height_out) const {
+  if (physical_safe_area_.w <= 0 || physical_safe_area_.h <= 0) {
+    return Window::GetPhysicalSafeArea(x_out, y_out, width_out, height_out);
+  }
+  x_out = physical_safe_area_.x;
+  y_out = physical_safe_area_.y;
+  width_out = physical_safe_area_.w;
+  height_out = physical_safe_area_.h;
+  return true;
+}
+
+void WindowSDL::RefreshPhysicalSafeArea() {
+  SDL_Rect logical_safe_area{};
+  if (!sdl_window_ || !SDL_GetWindowSafeArea(sdl_window_, &logical_safe_area)) {
+    physical_safe_area_.x = 0;
+    physical_safe_area_.y = 0;
+    physical_safe_area_.w = int(GetActualPhysicalWidth());
+    physical_safe_area_.h = int(GetActualPhysicalHeight());
+    return;
+  }
+
+  float density = SDL_GetWindowPixelDensity(sdl_window_);
+  if (!std::isfinite(density) || density <= 0.0f) {
+    density = 1.0f;
+  }
+  const double left = std::ceil(double(logical_safe_area.x) * double(density));
+  const double top = std::ceil(double(logical_safe_area.y) * double(density));
+  const double right =
+      std::floor(double(logical_safe_area.x + logical_safe_area.w) * double(density));
+  const double bottom =
+      std::floor(double(logical_safe_area.y + logical_safe_area.h) * double(density));
+  physical_safe_area_.x = int(left);
+  physical_safe_area_.y = int(top);
+  physical_safe_area_.w = std::max(int(right - left), 0);
+  physical_safe_area_.h = std::max(int(bottom - top), 0);
+}
+
 void WindowSDL::HandleDropEvent(SDL_Event& event) {
   WindowDestructionReceiver destruction_receiver(this);
   FileDropEvent e(this, std::filesystem::path(event.drop.data));
@@ -545,7 +675,25 @@ void WindowSDL::HandleDropEvent(SDL_Event& event) {
 
 void WindowSDL::HandleKeyEvent(SDL_Event& event) {
   VirtualKey virtual_key = TranslateSDLScancode(event.key.scancode);
+  const uint64_t trace_sequence = rex::input::IsInputTraceEnabled()
+                                      ? rex::input::NextInputTraceSequence()
+                                      : 0;
+  if (trace_sequence != 0) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=sdl-key key-name={} vk={} type={} down={} "
+        "repeat={} scancode={} key={} window={} keyboard={}",
+        trace_sequence,
+        rex::input::InputTraceVirtualKeyName(static_cast<uint32_t>(virtual_key)),
+        static_cast<uint32_t>(virtual_key),
+        static_cast<uint32_t>(event.type),
+        event.type == SDL_EVENT_KEY_DOWN, event.key.repeat,
+        static_cast<uint32_t>(event.key.scancode), static_cast<uint32_t>(event.key.key),
+        event.key.windowID, event.key.which);
+  }
   if (virtual_key == VirtualKey::kNone) {
+    if (trace_sequence != 0) {
+      REXLOG_INFO("input-e2e: seq={} stage=window-dispatch result=unmapped", trace_sequence);
+    }
     return;
   }
   SDL_Keymod mod = event.key.mod;
@@ -554,7 +702,8 @@ void WindowSDL::HandleKeyEvent(SDL_Event& event) {
              /*modifier_shift_pressed=*/(mod & SDL_KMOD_SHIFT) != 0,
              /*modifier_ctrl_pressed=*/(mod & SDL_KMOD_CTRL) != 0,
              /*modifier_alt_pressed=*/(mod & SDL_KMOD_ALT) != 0,
-             /*modifier_super_pressed=*/(mod & SDL_KMOD_GUI) != 0);
+             /*modifier_super_pressed=*/(mod & SDL_KMOD_GUI) != 0,
+             trace_sequence);
   WindowDestructionReceiver destruction_receiver(this);
   if (event.type == SDL_EVENT_KEY_DOWN) {
     OnKeyDown(e, destruction_receiver);
@@ -583,7 +732,7 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
   }
 }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
 void WindowSDL::AcceleratedPointerCallbackThunk(void* userdata, float delta_x, float delta_y) {
   static_cast<WindowSDL*>(userdata)->HandleAcceleratedPointerMotion(delta_x, delta_y);
 }
@@ -597,6 +746,15 @@ void WindowSDL::HandleAcceleratedPointerMotion(float delta_x, float delta_y) {
 #endif
 
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
+  // SDL may synthesize a virtual mouse from touch. Touch has an independent
+  // absolute-pointer path, so never let this duplicate enter relative camera
+  // motion, mouse buttons, or UI a second time.
+  if ((event.type == SDL_EVENT_MOUSE_MOTION && event.motion.which == SDL_TOUCH_MOUSEID) ||
+      ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+       event.button.which == SDL_TOUCH_MOUSEID) ||
+      (event.type == SDL_EVENT_MOUSE_WHEEL && event.wheel.which == SDL_TOUCH_MOUSEID)) {
+    return;
+  }
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = sdl_window_ ? SDL_GetWindowPixelDensity(sdl_window_) : 1.0f;
   if (density <= 0.0f) {
@@ -611,23 +769,27 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
       }
 
       MouseEvent::MotionSource motion_source = MouseEvent::MotionSource::kGeneric;
-#if REX_PLATFORM_MAC
-      // The AppKit monitor supplies the default accelerated NSEvent stream.
-      // SDL's nonzero GCMouse IDs identify raw physical-mouse motion. Ignore
-      // SDL's default stream while the monitor is installed to avoid counting
-      // the same accelerated event twice on systems without a GCMouse.
-      if (event.motion.which == 0 && accelerated_pointer_monitor_) {
-        break;
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+      switch (ClassifySdlMouseMotion(event.motion.which, accelerated_pointer_monitor_ != nullptr)) {
+        case SdlMouseMotionRoute::kSuppressAcceleratedDuplicate:
+          break;
+        case SdlMouseMotionRoute::kRawMouse:
+          motion_source = MouseEvent::MotionSource::kRawMouse;
+          [[fallthrough]];
+        case SdlMouseMotionRoute::kGeneric: {
+          MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
+                       int32_t(event.motion.y * density), 0, 0, event.motion.xrel,
+                       event.motion.yrel, true, motion_source);
+          OnMouseMove(e, destruction_receiver);
+          break;
+        }
       }
-      if (event.motion.which != 0 && event.motion.which != SDL_TOUCH_MOUSEID &&
-          event.motion.which != SDL_PEN_MOUSEID) {
-        motion_source = MouseEvent::MotionSource::kRawMouse;
-      }
-#endif
+#else
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
-                   int32_t(event.motion.y * density), 0, 0,
-                   event.motion.xrel, event.motion.yrel, true, motion_source);
+                   int32_t(event.motion.y * density), 0, 0, event.motion.xrel, event.motion.yrel,
+                   true, motion_source);
       OnMouseMove(e, destruction_receiver);
+#endif
       break;
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -652,6 +814,52 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     default:
       break;
   }
+}
+
+void WindowSDL::HandleTouchEvent(SDL_Event& event) {
+  // Trackpads can also emit SDL finger events. Only a direct screen contact
+  // may own a game touch control; relative/indirect devices keep mouse semantics.
+  if (SDL_GetTouchDeviceType(event.tfinger.touchID) != SDL_TOUCH_DEVICE_DIRECT) return;
+  if (event.tfinger.touchID == SDL_MOUSE_TOUCHID) {
+    return;
+  }
+
+  TouchEvent::Action action;
+  switch (event.type) {
+    case SDL_EVENT_FINGER_DOWN:
+      action = TouchEvent::Action::kDown;
+      break;
+    case SDL_EVENT_FINGER_MOTION:
+      action = TouchEvent::Action::kMove;
+      break;
+    case SDL_EVENT_FINGER_UP:
+      action = TouchEvent::Action::kUp;
+      break;
+    case SDL_EVENT_FINGER_CANCELED:
+      action = TouchEvent::Action::kCancel;
+      break;
+    default:
+      return;
+  }
+
+  int pixel_width = 0;
+  int pixel_height = 0;
+  if (sdl_window_) {
+    SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height);
+  }
+  if (pixel_width <= 0 || pixel_height <= 0) {
+    pixel_width = int(GetActualPhysicalWidth());
+    pixel_height = int(GetActualPhysicalHeight());
+  }
+  if (pixel_width <= 0 || pixel_height <= 0) {
+    return;
+  }
+
+  TouchEvent touch(this, uint64_t(event.tfinger.touchID), uint64_t(event.tfinger.fingerID), action,
+                   event.tfinger.x * float(pixel_width), event.tfinger.y * float(pixel_height),
+                   event.tfinger.pressure, event.tfinger.timestamp);
+  WindowDestructionReceiver destruction_receiver(this);
+  OnTouchEvent(touch, destruction_receiver);
 }
 
 }  // namespace rex::ui

@@ -342,6 +342,17 @@ class Window {
   // maximization, DPI, etc.
 
   void SetPresenter(Presenter* presenter);
+  GuestOutputTransform GetGuestOutputTransform() const {
+    return presenter_ ? presenter_->GetGuestOutputTransform() : GuestOutputTransform{};
+  }
+  virtual bool GetPhysicalSafeArea(int32_t& x_out, int32_t& y_out, int32_t& width_out,
+                                   int32_t& height_out) const {
+    x_out = 0;
+    y_out = 0;
+    width_out = int32_t(GetActualPhysicalWidth());
+    height_out = int32_t(GetActualPhysicalHeight());
+    return width_out > 0 && height_out > 0;
+  }
 
   // Request repainting of the surface. Can be called from non-UI threads as
   // long as they know the Surface exists and isn't in the middle of being
@@ -351,6 +362,22 @@ class Window {
     if (presenter_surface_) {
       RequestPaintImpl();
     }
+  }
+  // Request repainting after yielding the UI loop for a bounded platform
+  // tick. This is used for recoverable presentation backpressure; unlike an
+  // immediate request, it must not create a self-sustaining event-loop spin.
+  void RequestPaintAtUITick() {
+    if (presenter_surface_) {
+      RequestPaintAtUITickImpl();
+    }
+  }
+  // A cap deadline defers work, not the UI thread. Platforms with a native
+  // timer implement the delay; others retain their existing UI-tick fallback.
+  void RequestPaintAfterNanoseconds(uint64_t delay_ns) {
+    if (presenter_surface_) RequestPaintAfterNanosecondsImpl(delay_ns);
+  }
+  void RequestPaintAfter(uint32_t delay_ms) {
+    if (presenter_surface_) RequestPaintAfterImpl(delay_ms);
   }
   void RequestPresenterUIPaintFromUIThread() {
     if (presenter_) {
@@ -552,6 +579,15 @@ class Window {
   virtual std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) = 0;
   // Called only if the Surface exists.
   virtual void RequestPaintImpl() = 0;
+  virtual void RequestPaintAtUITickImpl() { RequestPaintImpl(); }
+  virtual void RequestPaintAfterNanosecondsImpl(uint64_t delay_ns) {
+    RequestPaintAfterImpl(uint32_t(std::min<uint64_t>(1000,
+        delay_ns / 1'000'000 + (delay_ns % 1'000'000 != 0))));
+  }
+  virtual void RequestPaintAfterImpl(uint32_t delay_ms) {
+    (void)delay_ms;
+    RequestPaintAtUITickImpl();
+  }
 
   // Will also disconnect the surface if needed.
   void OnBeforeClose(WindowDestructionReceiver& destruction_receiver);

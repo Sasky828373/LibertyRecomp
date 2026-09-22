@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/ui/frame_pacer.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -31,6 +32,8 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/guest_output_transform.h>
+#include <rex/ui/frame_pixel_probe.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/ui_drawer.h>
 
@@ -106,6 +109,27 @@ struct RawImage {
   size_t stride = 0;
   // R8 G8 B8 X8. The last row is not required to be padded to the stride.
   std::vector<uint8_t> data;
+};
+
+struct GuestOutputProvenance {
+  uint32_t frame_rate_limit = 0;
+  bool producer_backpressure = false;
+  uint64_t publication_serial = 0;
+  uint64_t tv_session_id = 0;
+  uint64_t title_present_id = 0;
+  uint64_t selected_generation = 0;
+  uint64_t tv_final_sequence = 0;
+  uint64_t tv_movie_sequence = 0;
+  uint64_t tv_rect_sequence = 0;
+  uint64_t tv_bink_sequence = 0;
+  uint32_t submitted_frame = 0;
+  uint32_t present_origin = 0;
+  uint32_t guest_caller = 0;
+  uint32_t selected_texture = 0;
+  uint32_t native_command_count = 0;
+  uint32_t tv_bink_result = 0;
+  bool diagnostic_trace = false;
+  FramePixelProbe frame_pixel_probe{};
 };
 
 // The presenter displays up to two layers of content on a host surface:
@@ -190,6 +214,12 @@ class Presenter {
 
   class GuestOutputRefreshContext {
    public:
+    class Completion {
+     public:
+      virtual ~Completion() = default;
+      virtual bool Await() = 0;
+    };
+
     GuestOutputRefreshContext(const GuestOutputRefreshContext& context) = delete;
     GuestOutputRefreshContext& operator=(const GuestOutputRefreshContext& context) = delete;
     virtual ~GuestOutputRefreshContext() = default;
@@ -198,6 +228,12 @@ class Presenter {
     // (though the image provided by the refresher may still have a higher
     // storage precision). If never called, assuming it's false.
     void SetIs8bpc(bool is_8bpc) { is_8bpc_out_ref_ = is_8bpc; }
+    void SetFramePixelProbe(const FramePixelProbe& probe) { frame_pixel_probe_ = probe; }
+    const FramePixelProbe& frame_pixel_probe() const { return frame_pixel_probe_; }
+    void SetCompletion(std::shared_ptr<Completion> completion) {
+      completion_ = std::move(completion);
+    }
+    const std::shared_ptr<Completion>& completion() const { return completion_; }
 
    protected:
     GuestOutputRefreshContext(bool& is_8bpc_out_ref) : is_8bpc_out_ref_(is_8bpc_out_ref) {
@@ -205,7 +241,9 @@ class Presenter {
     }
 
    private:
+    FramePixelProbe frame_pixel_probe_{};
     bool& is_8bpc_out_ref_;
+    std::shared_ptr<Completion> completion_;
   };
 
   class GuestOutputPaintConfig {
@@ -357,14 +395,19 @@ class Presenter {
   // primitives required by the GuestOutputRefreshContext implementation.
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
-                          std::function<bool(GuestOutputRefreshContext& context)> refresher);
+                          std::function<bool(GuestOutputRefreshContext& context)> refresher,
+                          GuestOutputProvenance provenance = {});
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  void CancelFramePacingWaits() { frame_publication_gate_.Stop(); }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
+  // Thread-safe snapshot of the exact final guest-output rectangle last
+  // calculated by the common presenter path.
+  GuestOutputTransform GetGuestOutputTransform() const;
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
 
@@ -381,6 +424,9 @@ class Presenter {
     // Refused for internal reasons or a host API side failure, but still may
     // try to present without resetting the graphics provider in the future.
     kNotPresented,
+    // Temporarily backpressured. The caller must yield to the window event
+    // loop and request another paint rather than blocking for GPU/WSI progress.
+    kNotPresentedRetry,
     kNotPresentedConnectionOutdated,
     kGpuLostExternally,
     kGpuLostResponsible,
@@ -407,6 +453,7 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    GuestOutputProvenance provenance;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -421,6 +468,7 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      provenance = {};
     }
   };
 
@@ -715,6 +763,11 @@ class Presenter {
   //
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  virtual void PollPresentationTiming() {}
+  // Backend calls this after a successful queue-present with the exact consumed image.
+  void AcceptPacedPublication(uint64_t serial) { frame_publication_gate_.Accept(serial); }
+  const FramePacer::Attempt& pacing_attempt() const { return pacing_attempt_; }
+  FramePacer& frame_pacer() { return frame_pacer_; }
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
@@ -823,7 +876,8 @@ class Presenter {
   // (not closed) is available in it, so doesn't check the surface painting
   // connection state. Returns whether the window_->RequestPaint() call has been
   // made.
-  bool RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick);
+  bool RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick,
+                                                   bool defer_until_ui_tick = false);
 
   // Platform-specific function refreshing the monitor the current window
   // surface is on, through the Surface or its Window. A reference to the
@@ -848,6 +902,8 @@ class Presenter {
   PaintResult PaintAndPresent(bool execute_ui_drawers);
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
+  void InvalidateGuestOutputTransform() const;
+  void UpdateGuestOutputTransform(const GuestOutputTransform& transform) const;
 
   bool AreUITicksNeededFromUIThread() const {
     // UI drawing should be done, and painting needs to be possible (coarsely
@@ -943,6 +999,9 @@ class Presenter {
   // UI thread: writable, guest output thread: read-only.
   GuestOutputPaintConfig guest_output_paint_config_;
 
+  mutable std::mutex guest_output_transform_mutex_;
+  mutable GuestOutputTransform guest_output_transform_;
+
   // Single-producer-multiple-consumers (lock-free SPSC + consumer lock) mailbox
   // for presenting of the most up-to-date guest output image without long
   // interlocking between guest output refreshing and painting.
@@ -982,6 +1041,13 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+  std::atomic<uint32_t> host_frame_rate_limit_{0};
+  FramePacer frame_pacer_;  // Existing exclusive paint owner.
+  FramePacer::Attempt pacing_attempt_{};
+  FramePublicationGate frame_publication_gate_;
+  const std::thread::id ui_thread_id_ = std::this_thread::get_id();
+  std::atomic<uint64_t> paint_retry_delay_ns_{1'000'000};
+  uint64_t host_rate_trace_count_ = 0;
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

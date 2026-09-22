@@ -107,24 +107,37 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         properties.deviceName);
     return nullptr;
   }
+  if (with_native_shader_support && !supported_features.depthClamp) {
+    REXLOG_WARN(
+        "Vulkan device '{}' doesn't support depthClamp required by Liberty native rendering",
+        properties.deviceName);
+    return nullptr;
+  }
+  if (with_native_shader_support &&
+      (!supported_features.shaderClipDistance || !supported_features.sampleRateShading)) {
+    // These capabilities are declared statically by the cached title vertex
+    // shaders and the per-sample fullscreen conversion shaders, respectively.
+    // A draw-time flag cannot make either shader interface legal without them.
+    REXLOG_WARN(
+        "Vulkan device '{}' lacks native shader capabilities: shaderClipDistance={}, "
+        "sampleRateShading={}",
+        properties.deviceName, supported_features.shaderClipDistance != VK_FALSE,
+        supported_features.sampleRateShading != VK_FALSE);
+    return nullptr;
+  }
+
+  if ((with_gpu_emulation || with_native_shader_support) &&
+      !supported_features.independentBlend) {
+    // Independent per-target blend equations and write masks cannot be
+    // represented faithfully without this feature.
+    REXLOG_WARN(
+        "Vulkan device '{}' doesn't support the independentBlend feature "
+        "required for GPU emulation or Liberty native rendering",
+        properties.deviceName);
+    return nullptr;
+  }
 
   if (with_gpu_emulation) {
-    if (!supported_features.independentBlend) {
-      // Not trivial to work around:
-      // - Affects not only the blend equation, but also the color write mask.
-      // - Can't reuse the blend state of the first attachment for all because
-      //   some attachments may have a format that doesn't support blending.
-      // - Not possible to split the draw into per-attachment draws because of
-      //   depth / stencil.
-      // Not supported only on the proprietary driver for the Qualcomm
-      // Adreno 4xx, where the driver is largely experimental and doesn't expose
-      // a lot of the functionality available in the hardware.
-      REXLOG_WARN(
-          "Vulkan device '{}' doesn't support the independentBlend feature "
-          "required for GPU emulation",
-          properties.deviceName);
-      return nullptr;
-    }
     if (!supported_features.fragmentStoresAndAtomics) {
       REXLOG_WARN(
           "Vulkan device '{}' doesn't support fragmentStoresAndAtomics, which "
@@ -217,6 +230,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+    XE_UI_VULKAN_STRUCT_EXTENSION(GOOGLE_display_timing)
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -224,12 +238,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
-  bool ext_1_3_KHR_dynamic_rendering = false;
   bool ext_EXT_non_seamless_cube_map = false;
   if (get_physical_device_properties2_supported &&
-      (with_gpu_emulation || with_dynamic_rendering)) {
-    // #55.
-    XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+      (with_gpu_emulation || with_native_shader_support)) {
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_clip_control)
   }
   if (with_gpu_emulation) {
     // #15.
@@ -324,12 +336,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
+  VkPhysicalDeviceVulkan12Properties properties_1_2 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
   VulkanFeatures<VkPhysicalDeviceVulkan13Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>
       features_1_3;
   VulkanFeatures<VkPhysicalDevicePortabilitySubsetFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR>
       features_KHR_portability_subset;
+  VkPhysicalDevicePortabilitySubsetPropertiesKHR properties_KHR_portability_subset = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_PROPERTIES_KHR};
   VkPhysicalDeviceDriverPropertiesKHR properties_1_2_KHR_driver_properties = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceFloatControlsProperties properties_1_2_KHR_shader_float_controls = {
@@ -337,6 +353,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
+  VulkanFeatures<VkPhysicalDeviceDepthClipControlFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT>
+      features_EXT_depth_clip_control;
   VulkanFeatures<VkPhysicalDeviceDynamicRenderingFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR>
       features_1_3_KHR_dynamic_rendering;
@@ -358,11 +377,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
       features_1_2.Link(supported_features_2, device_create_info);
+      properties_1_2.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_1_2;
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
     } else {
-      if (ext_1_3_KHR_dynamic_rendering) {
+      if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
         features_1_3_KHR_dynamic_rendering.Link(supported_features_2, device_create_info);
       }
       if (ext_1_3_EXT_shader_demote_to_helper_invocation) {
@@ -372,6 +393,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (ext_KHR_portability_subset) {
       features_KHR_portability_subset.Link(supported_features_2, device_create_info);
+      properties_KHR_portability_subset.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_portability_subset;
     }
     if (ext_1_2_KHR_driver_properties) {
       properties_1_2_KHR_driver_properties.pNext = properties_2.pNext;
@@ -383,6 +406,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_depth_clip_control) {
+      features_EXT_depth_clip_control.Link(supported_features_2, device_create_info);
     }
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2, device_create_info);
@@ -415,7 +441,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     const bool dynamic_rendering_supported =
         properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)
             ? features_1_3.supported.dynamicRendering != VK_FALSE
-            : ext_1_3_KHR_dynamic_rendering &&
+            : device->extensions_.ext_1_3_KHR_dynamic_rendering &&
                   features_1_3_KHR_dynamic_rendering.supported.dynamicRendering != VK_FALSE;
     if (!dynamic_rendering_supported) {
       REXLOG_WARN("Vulkan device '{}' doesn't support dynamic rendering required by the native "
@@ -645,15 +671,32 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSampledImages)
   XE_UI_VULKAN_LIMIT(maxPerStageResources)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetSamplers)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetSampledImages)
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxUpdateAfterBindDescriptorsInAllPools)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSamplers)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSampledImages)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageUpdateAfterBindResources)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSamplers)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSampledImages)
+  }
   XE_UI_VULKAN_LIMIT(maxVertexOutputComponents)
+  XE_UI_VULKAN_LIMIT(maxVertexInputBindings)
+  XE_UI_VULKAN_LIMIT(maxVertexInputAttributes)
+  XE_UI_VULKAN_LIMIT(maxVertexInputBindingStride)
+  XE_UI_VULKAN_LIMIT(maxVertexInputAttributeOffset)
   XE_UI_VULKAN_LIMIT(maxTessellationEvaluationOutputComponents)
   XE_UI_VULKAN_LIMIT(maxGeometryInputComponents)
   XE_UI_VULKAN_LIMIT(maxGeometryOutputComponents)
   XE_UI_VULKAN_LIMIT(maxFragmentInputComponents)
   XE_UI_VULKAN_LIMIT(maxFragmentCombinedOutputResources)
   XE_UI_VULKAN_LIMIT(maxSamplerAnisotropy)
+  XE_UI_VULKAN_LIMIT(maxSamplerLodBias)
   XE_UI_VULKAN_LIMIT(maxViewportDimensions[0])
   XE_UI_VULKAN_LIMIT(maxViewportDimensions[1])
+  XE_UI_VULKAN_LIMIT(viewportBoundsRange[0])
+  XE_UI_VULKAN_LIMIT(viewportBoundsRange[1])
   XE_UI_VULKAN_LIMIT(minUniformBufferOffsetAlignment)
   XE_UI_VULKAN_LIMIT(minStorageBufferOffsetAlignment)
   XE_UI_VULKAN_LIMIT(maxFramebufferWidth)
@@ -679,23 +722,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       REXLOG_INFO("* robustBufferAccess omitted because MoltenVK cannot implement it on Metal");
     }
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
-    XE_UI_VULKAN_FEATURE(independentBlend)
     XE_UI_VULKAN_FEATURE(geometryShader)
     XE_UI_VULKAN_FEATURE(tessellationShader)
-    XE_UI_VULKAN_FEATURE(sampleRateShading)
-    XE_UI_VULKAN_FEATURE(depthClamp)
-    XE_UI_VULKAN_FEATURE(fillModeNonSolid)
     XE_UI_VULKAN_FEATURE(occlusionQueryPrecise)
     XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
-    XE_UI_VULKAN_FEATURE(shaderClipDistance)
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
 
   if (with_gpu_emulation || with_native_shader_support) {
+    XE_UI_VULKAN_FEATURE(sampleRateShading)
+    XE_UI_VULKAN_FEATURE(independentBlend)
+    XE_UI_VULKAN_FEATURE(depthClamp)
+    XE_UI_VULKAN_FEATURE(fillModeNonSolid)
     XE_UI_VULKAN_FEATURE(samplerAnisotropy)
+    XE_UI_VULKAN_FEATURE(shaderClipDistance)
   }
 
   if (with_native_shader_support) {
@@ -703,14 +746,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
-    if (with_gpu_emulation) {
+    if (with_gpu_emulation || with_native_shader_support) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+    }
+    if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
     }
     if (with_native_shader_support) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
+      // Vulkan uses descriptorBindingSampledImageUpdateAfterBind for sampler,
+      // combined-image-sampler and sampled-image descriptors; there is no
+      // separate VkPhysicalDeviceVulkan12Features sampler member.
+      device->properties_.descriptorBindingSamplerUpdateAfterBind =
+          features_1_2.supported.descriptorBindingSampledImageUpdateAfterBind;
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingVariableDescriptorCount);
       XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
     }
   } else {
@@ -727,7 +780,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
     }
   } else {
-    if (ext_1_3_KHR_dynamic_rendering) {
+    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
       if (with_gpu_emulation || with_dynamic_rendering) {
         XE_UI_VULKAN_FEATURE_2(features_1_3_KHR_dynamic_rendering, dynamicRendering);
       }
@@ -741,6 +794,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (ext_KHR_portability_subset) {
+    device->properties_.portabilitySubset = true;
+    XE_UI_VULKAN_PROPERTY_2(properties_KHR_portability_subset,
+                           minVertexInputBindingStrideAlignment)
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, constantAlphaColorBlendFactors)
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, imageViewFormatReinterpretation)
@@ -749,6 +805,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, separateStencilMaskRef)
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset,
                              shaderSampleRateInterpolationFunctions)
+    } else if (with_native_shader_support) {
+      // Feature enablement is separate from native ordinary-texture policy:
+      // those views remain identity; vector-font atlases need swizzling.
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, constantAlphaColorBlendFactors)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, imageViewFormatSwizzle)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, samplerMipLodBias)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, separateStencilMaskRef)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, triangleFans)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, vertexAttributeAccessBeyondStride)
     }
   } else {
     // Not a portability subset device.
@@ -758,6 +823,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE_IMPLIED(pointPolygons)
     XE_UI_VULKAN_FEATURE_IMPLIED(separateStencilMaskRef)
     XE_UI_VULKAN_FEATURE_IMPLIED(shaderSampleRateInterpolationFunctions)
+    XE_UI_VULKAN_FEATURE_IMPLIED(samplerMipLodBias)
+    XE_UI_VULKAN_FEATURE_IMPLIED(triangleFans)
+    XE_UI_VULKAN_FEATURE_IMPLIED(vertexAttributeAccessBeyondStride)
   }
 
   if (ext_1_2_KHR_shader_float_controls) {
@@ -773,6 +841,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_EXT_fragment_shader_interlock, fragmentShaderSampleInterlock)
       XE_UI_VULKAN_FEATURE_2(features_EXT_fragment_shader_interlock, fragmentShaderPixelInterlock)
     }
+  }
+
+  if (device->extensions_.ext_EXT_depth_clip_control &&
+      (with_gpu_emulation || with_native_shader_support)) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_clip_control, depthClipControl)
   }
 
   if (ext_EXT_non_seamless_cube_map) {
@@ -872,6 +945,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
+
+  if (device->extensions_.ext_GOOGLE_display_timing) {
+    dfn.vkGetRefreshCycleDurationGOOGLE = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkGetRefreshCycleDurationGOOGLE"));
+    dfn.vkGetPastPresentationTimingGOOGLE = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkGetPastPresentationTimingGOOGLE"));
+    if (!dfn.vkGetRefreshCycleDurationGOOGLE || !dfn.vkGetPastPresentationTimingGOOGLE) {
+      device->extensions_.ext_GOOGLE_display_timing = false;
+      REXLOG_WARN("Presentation timing entry points unavailable; using software pacing");
+    }
+  }
 
   if (!functions_loaded) {
     REXLOG_ERROR("Failed to get all Vulkan device function pointers for '{}'",

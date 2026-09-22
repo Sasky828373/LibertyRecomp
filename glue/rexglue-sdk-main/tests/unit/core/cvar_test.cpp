@@ -540,7 +540,7 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     REXCVAR_SET(test_int32_flag, 777);
     REXCVAR_SET(test_string_flag, "saved_value");
 
-    rex::cvar::SaveConfig(save_path);
+    CHECK(rex::cvar::SaveConfig(save_path));
 
     // Verify file exists and contains expected content
     REQUIRE(std::filesystem::exists(save_path));
@@ -558,10 +558,24 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     std::filesystem::remove(save_path);
   }
 
-  SECTION("SaveConfig with no modifications creates no file or empty") {
+  SECTION("SaveConfig with no modifications writes a default configuration") {
     rex::cvar::testing::ResetAllForTesting();
-    rex::cvar::SaveConfig(save_path);
-    // Either file doesn't exist or is minimal (just header comment)
+    CHECK(rex::cvar::SaveConfig(save_path));
+    REQUIRE(std::filesystem::exists(save_path));
+    std::filesystem::remove(save_path);
+  }
+
+  SECTION("Saving restored defaults removes previously saved overrides") {
+    REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "saved_override"));
+    REQUIRE(rex::cvar::SaveConfig(save_path));
+    rex::cvar::ResetToDefault("test_string_flag");
+    REQUIRE(rex::cvar::SerializeToTOML().empty());
+    REQUIRE(rex::cvar::SaveConfig(save_path));
+
+    rex::cvar::LoadConfig(save_path);
+    CHECK(rex::cvar::GetFlagByName("test_string_flag") == "default");
+    CHECK(rex::cvar::SerializeToTOML().empty());
+    std::filesystem::remove(save_path);
   }
 }
 
@@ -609,4 +623,17 @@ TEST_CASE("cvar InvokeCommand dispatches commands", "[cvar]") {
   SECTION("missing name returns false") {
     CHECK_FALSE(rex::cvar::InvokeCommand("does_not_exist", ""));
   }
+}
+
+
+TEST_CASE("Saving default cvars removes an obsolete saved frame cap", "[cvar][display-settings]") {
+  rex::cvar::testing::ScopedLifecycleOverride override;
+  rex::cvar::ResetAllToDefaults();
+  const auto path = std::filesystem::temp_directory_path() / "rex-display-default-save.toml";
+  { std::ofstream file(path); file << "gta4_frame_limit = 30\n"; }
+  REQUIRE(rex::cvar::SaveConfig(path));
+  std::ifstream file(path);
+  const std::string text((std::istreambuf_iterator<char>(file)), {});
+  REQUIRE(text.find("gta4_frame_limit = 30") == std::string::npos);
+  std::filesystem::remove(path);
 }

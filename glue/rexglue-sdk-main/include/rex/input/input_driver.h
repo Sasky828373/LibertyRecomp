@@ -15,7 +15,7 @@
 
 #include <rex/input/input.h>
 #include <rex/input/motion.h>
-#include <rex/kernel.h>
+#include <rex/system/xtypes.h>
 #include <rex/ui/window.h>
 
 namespace rex::ui {
@@ -31,6 +31,7 @@ class InputDriver {
   virtual ~InputDriver() = default;
 
   virtual X_STATUS Setup() = 0;
+  virtual const char* trace_name() const { return "input-driver"; }
 
   virtual X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                                    X_INPUT_CAPABILITIES* out_caps) = 0;

@@ -268,7 +268,15 @@ if(REXGLUE_USE_VULKAN)
 
     add_library(rexgpu-gta4-native SHARED
         gta4_native/graphics_system.cpp
+        gta4_native/modern_shader_options.cpp
+        gta4_native/shader_override_policy.h
+        gta4_native/native_buffer_arena.cpp
+        gta4_native/native_descriptor_backend.cpp
+        gta4_native/native_frame_context.cpp
+        gta4_native/native_gpu_attribution.cpp
+        gta4_native/native_memory_samples.cpp
         gta4_native/native_performance_samples.cpp
+        gta4_native/native_submission_lifetime.cpp
         gta4_native/postfx_resource_pool.cpp
         gta4_native/smaa_pipeline.cpp
         gta4_native/split_postfx_pass.cpp
@@ -282,6 +290,9 @@ if(REXGLUE_USE_VULKAN)
         "${GTA4_NATIVE_SHADER_CACHE_ROOT}/shader/shader_cache.cpp"
         PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers"
     )
+    if(APPLE)
+        target_sources(rexgpu-gta4-native PRIVATE gta4_native/native_resource_reclaimer_mac.mm)
+    endif()
     add_library(rex::gpu-gta4-native ALIAS rexgpu-gta4-native)
     rexgpu_configure_plugin(rexgpu-gta4-native gpu-gta4-native)
     target_include_directories(rexgpu-gta4-native PRIVATE

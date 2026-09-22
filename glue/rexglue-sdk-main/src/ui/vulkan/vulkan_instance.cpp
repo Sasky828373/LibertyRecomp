@@ -17,6 +17,7 @@
 
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
+#include <rex/diagnostics/gpu_flight_recorder.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
@@ -27,6 +28,11 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+
+#if REX_PLATFORM_MAC
+REXCVAR_DEFINE_BOOL(vulkan_moltenvk_synchronous_queue_submits, false, "UI/Vulkan",
+                    "Process Vulkan queue submissions synchronously in MoltenVK");
+#endif
 
 namespace rex {
 namespace ui {
@@ -124,6 +130,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // Name pointers from `requested_extensions` will be used in the enabled
   // extensions vector.
   std::unordered_map<std::string, bool*> requested_extensions;
+#if REX_PLATFORM_MAC && defined(VK_EXT_layer_settings)
+  bool extension_ext_layer_settings = false;
+  requested_extensions.emplace(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME,
+                               &extension_ext_layer_settings);
+#endif
   if (vulkan_instance->api_version_ >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     vulkan_instance->extensions_.ext_1_1_KHR_get_physical_device_properties2 = true;
   } else {
@@ -349,6 +360,25 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   VkInstanceCreateInfo instance_create_info;
   instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_create_info.pNext = nullptr;
+#if REX_PLATFORM_MAC && defined(VK_EXT_layer_settings)
+  VkBool32 moltenvk_synchronous_queue_submits =
+      REXCVAR_GET(vulkan_moltenvk_synchronous_queue_submits) ? VK_TRUE : VK_FALSE;
+  VkLayerSettingEXT moltenvk_queue_setting{};
+  moltenvk_queue_setting.pLayerName = "MoltenVK";
+  moltenvk_queue_setting.pSettingName = "MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS";
+  moltenvk_queue_setting.type = VK_LAYER_SETTING_TYPE_BOOL32_EXT;
+  moltenvk_queue_setting.valueCount = 1;
+  moltenvk_queue_setting.pValues = &moltenvk_synchronous_queue_submits;
+  VkLayerSettingsCreateInfoEXT layer_settings_info{};
+  layer_settings_info.sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
+  layer_settings_info.settingCount = 1;
+  layer_settings_info.pSettings = &moltenvk_queue_setting;
+  if (extension_ext_layer_settings) {
+    instance_create_info.pNext = &layer_settings_info;
+    REXLOG_INFO("MoltenVK synchronous queue submissions: {}",
+                moltenvk_synchronous_queue_submits == VK_TRUE);
+  }
+#endif
   instance_create_info.flags = 0;
   // VK_KHR_get_physical_device_properties2 is needed to get the portability
   // subset features.
@@ -475,11 +505,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   // Create the debug messenger if requested and available.
 
-  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan) &&
+  if ((rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan) ||
+       rex::diagnostics::gpu_flight::IsEnabled()) &&
       vulkan_instance->extensions_.ext_EXT_debug_utils &&
       REXCVAR_GET(vulkan_log_debug_messages)) {
     VkDebugUtilsMessengerCreateInfoEXT debug_utils_messenger_create_info = {
         VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    if (rex::diagnostics::gpu_flight::IsEnabled()) {
+      debug_utils_messenger_create_info.messageSeverity |=
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    }
     auto gpu_logger = rex::GetLogger(rex::log::gpu());
     if (gpu_logger) {
       if (gpu_logger->should_log(spdlog::level::debug)) {
@@ -561,6 +596,17 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
     VkDebugUtilsMessageTypeFlagsEXT message_types,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data, [[maybe_unused]] void* user_data) {
+  if (callback_data && callback_data->pMessage &&
+      message_severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+    const std::string_view message(callback_data->pMessage);
+    // MoltenVK reports the original Metal command-buffer error here before
+    // later fence/present calls report the resulting lost logical device.
+    if (message.find("Lost VkDevice") != std::string_view::npos ||
+        message.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos) {
+      rex::diagnostics::gpu_flight::Fail("driver.device-lost", VK_ERROR_DEVICE_LOST,
+                                        uint64_t(uintptr_t(user_data)));
+    }
+  }
   std::ostringstream log_str;
 
   log_str << "Vulkan " << vk::to_string(vk::DebugUtilsMessageSeverityFlagBitsEXT(message_severity))

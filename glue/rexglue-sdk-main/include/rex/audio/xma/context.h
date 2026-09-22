@@ -240,6 +240,7 @@ class XmaContext {
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
+  void ResetDecoderStreamLocked();
 
   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
   int PrepareDecoder(int sample_rate, bool is_two_channel);
@@ -254,6 +255,8 @@ class XmaContext {
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
 
+  // Diagnostic counters, not guest/hardware state. Access under lock_.
+  uint64_t handoff_generation_ = 0, handoff_codec_epoch_ = 0, handoff_frame_ = 0;
   uint32_t id_ = 0;
   uint32_t guest_ptr_ = 0;
   std::mutex lock_;
@@ -265,6 +268,8 @@ class XmaContext {
   AVCodec* av_codec_ = nullptr;
   AVCodecContext* av_context_ = nullptr;
   AVFrame* av_frame_ = nullptr;
+  // Protected by lock_; cleared only after successful fresh codec creation.
+  bool decoder_reset_pending_ = true;
 
   // Packet data buffer (two packets worth for split frame handling)
   std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;

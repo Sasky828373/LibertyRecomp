@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <rex/filesystem/device.h>
 #include <rex/math.h>
@@ -32,7 +33,8 @@ class StfsContainerDevice : public Device {
  public:
   const static uint32_t kBlockSize = 0x1000;
 
-  StfsContainerDevice(const std::string_view mount_path, const std::filesystem::path& host_path);
+  StfsContainerDevice(const std::string_view mount_path, const std::filesystem::path& host_path,
+                      bool log_host_path = true);
   ~StfsContainerDevice() override;
 
   bool Initialize() override;
@@ -112,7 +114,8 @@ class StfsContainerDevice : public Device {
   Error ReadHeaderAndVerify(FILE* header_file);
 
   Error ReadSVOD();
-  Error ReadEntrySVOD(uint32_t sector, uint32_t ordinal, StfsContainerEntry* parent);
+  Error ReadEntrySVOD(uint32_t sector, uint32_t ordinal, StfsContainerEntry* parent,
+                      size_t depth);
   void BlockToOffsetSVOD(size_t sector, size_t* address, size_t* file_index);
 
   Error ReadSTFS();
@@ -124,6 +127,7 @@ class StfsContainerDevice : public Device {
 
   std::string name_;
   std::filesystem::path host_path_;
+  bool log_host_path_;
 
   std::map<size_t, FILE*> files_;
   size_t files_total_size_;
@@ -137,6 +141,8 @@ class StfsContainerDevice : public Device {
   uint32_t block_step[2];
 
   std::unordered_map<size_t, StfsHashTable> cached_hash_tables_;
+  std::unordered_set<uint64_t> svod_visited_entries_;
+  size_t svod_entry_count_ = 0;
 };
 
 }  // namespace rex::filesystem

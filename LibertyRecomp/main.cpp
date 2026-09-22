@@ -31,6 +31,14 @@
 #include <image.h>
 #include <hid/hid.h>
 #include <user/config.h>
+#if REX_PLATFORM_NX
+extern "C" bool SwitchAppletIsRunning(void);
+#endif
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+#include <hid/context_touch_host.h>
+#include <rex/cvar.h>
+REXCVAR_DECLARE(std::string, touch_controls);
+#endif
 #include <user/paths.h>
 #include <user/registry.h>
 #include <kernel/xdbf.h>
@@ -81,6 +89,10 @@
 #include <rex/kernel/crt/heap.h>
 #include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
+#if !REX_PLATFORM_CONSOLE
+#include <rex/input/mnk/controller_compatibility.h>
+#include <rex/ui/sdl_virtual_key.h>
+#endif
 #if defined(LIBERTY_RECOMP_PS4)
 #include "../glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h"
 #elif REX_PLATFORM_NX
@@ -118,8 +130,9 @@ static std::array<std::string_view, 3> g_D3D12RequiredModules =
 // translation unit that defines main() aliases `main` → `SDL_main` at preprocess
 // time, so the existing main() body below gets picked up correctly. On desktop
 // this header is also a no-op unless SDL_MAIN_HANDLED is NOT defined; we leave
-// it Android-only to avoid perturbing the other platforms.
-#if defined(__ANDROID__)
+// it mobile-only to preserve desktop entry points.
+#if defined(__ANDROID__) || REX_PLATFORM_IOS
+#undef SDL_MAIN_HANDLED
 #include <SDL3/SDL_main.h>
 #endif
 
@@ -483,6 +496,9 @@ int main(int argc, char *argv[])
     const char *sdlVideoDriver = nullptr;
     std::string sdlVideoDriverStr;
     std::string diagnosticsCategories;
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+    std::string touchControlsOverride;
+#endif
 
     // Parse the command-line diagnostics policy before installing log sinks,
     // starting diagnostic threads, or creating the graphics plugin. The
@@ -498,6 +514,11 @@ int main(int argc, char *argv[])
         cli.add_flag("--graphics-api-retry",   graphicsApiRetry,           "Retry with an alternative graphics API on failure");
         cli.add_flag("--skip-logos",           skipLogos,                  "Skip publisher/developer logos at startup");
         cli.add_option("--sdl-video-driver",   sdlVideoDriverStr,          "Override the SDL video driver");
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+        cli.add_option("--touch-controls,--touch_controls", touchControlsOverride,
+                       "Screen controls: auto, on, or off (saved to Input.TouchControls)")
+            ->check(CLI::IsMember({"auto", "on", "off"}));
+#endif
         cli.add_flag("--diagnostics", diagnostics,
                      "Enable diagnostic logging and instrumentation");
         cli.add_option("--diagnostics-categories", diagnosticsCategories,
@@ -545,6 +566,43 @@ int main(int argc, char *argv[])
     }
 
     Config::Load();
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+    if (!touchControlsOverride.empty()) Config::TouchControls = touchControlsOverride;
+    if (Config::TouchControls.Value != "auto" && Config::TouchControls.Value != "on" &&
+        Config::TouchControls.Value != "off") Config::TouchControls = std::string("auto");
+    REXCVAR_SET(touch_controls, Config::TouchControls.Value);
+    if (!touchControlsOverride.empty()) Config::Save();
+    TouchHost::Initialize(GetUserPath() / "touch-controls.ini");
+#endif
+
+#if !REX_PLATFORM_CONSOLE
+    // Native PC input owns GTA's action records, but retail code also reads
+    // digital controller buttons directly for pause/cutscene/frontend paths.
+    // Preserve the user's configured Xbox meanings as a button-only overlay;
+    // WASD and mouse axes intentionally remain native-only.
+    rex::input::mnk::SetNativeControllerCompatibilityBindings({
+        .a = rex::ui::TranslateSDLScancode(Config::Key_A.Value),
+        // The PC layout's Space key is the PlayStation Cross / Xbox A
+        // compatibility action used by retail cutscene and accept consumers.
+        .a_alias = rex::ui::TranslateSDLScancode(Config::Key_X.Value),
+        .b = rex::ui::TranslateSDLScancode(Config::Key_B.Value),
+        .y = rex::ui::TranslateSDLScancode(Config::Key_Y.Value),
+        .dpad_up = rex::ui::TranslateSDLScancode(Config::Key_DPadUp.Value),
+        .dpad_down = rex::ui::TranslateSDLScancode(Config::Key_DPadDown.Value),
+        .dpad_left = rex::ui::TranslateSDLScancode(Config::Key_DPadLeft.Value),
+        .dpad_right = rex::ui::TranslateSDLScancode(Config::Key_DPadRight.Value),
+        .start = rex::ui::TranslateSDLScancode(Config::Key_Start.Value),
+        .back = rex::ui::TranslateSDLScancode(Config::Key_Back.Value),
+        .left_shoulder =
+            rex::ui::TranslateSDLScancode(Config::Key_LeftBumper.Value),
+        .right_shoulder =
+            rex::ui::TranslateSDLScancode(Config::Key_RightBumper.Value),
+        .left_trigger =
+            rex::ui::TranslateSDLScancode(Config::Key_LeftTrigger.Value),
+        .right_trigger =
+            rex::ui::TranslateSDLScancode(Config::Key_RightTrigger.Value),
+    });
+#endif
 
     // RexGlue logging init happens inside os::logger::Init() (see C4 refactor):
     // os::logger::Init() now calls rex::InitLogging() + registers platform sinks.
@@ -697,7 +755,11 @@ int main(int argc, char *argv[])
 #else
         rexConfig.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
 #endif
+#if defined(GTA4_SONY_LEGACY_OWNER)
+        rexConfig.input_factory = REX_INPUT_BACKEND(hid::CreateRexInputSystem);
+#else
         rexConfig.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
+#endif
         switch (Config::MultiplayerBackend.Value)
         {
             case EMultiplayerBackend::LAN:
@@ -1199,9 +1261,6 @@ int main(int argc, char *argv[])
 
     // Main thread: pump SDL events while game runs on XThread.
     // SDL requires event pumping on the main thread (macOS Cocoa requirement).
-#if REX_PLATFORM_NX
-    extern bool SwitchAppletIsRunning();
-#endif
 #if defined(LIBERTY_RECOMP_DISCORD_RPC)
     static int s_discordCallbackTick = 0;
 #endif
@@ -1210,8 +1269,17 @@ int main(int argc, char *argv[])
            && SwitchAppletIsRunning()
 #endif
     ) {
+#if REX_PLATFORM_NX && defined(GTA4_TOUCH_LEGACY_HOST)
+        TouchHost::PumpSwitch();
+#endif
 #if !REX_PLATFORM_CONSOLE
         SDL_PumpEvents();
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+        TouchHost::PumpSDLEvents();
+#endif
+#if defined(GTA4_SONY_LEGACY_OWNER)
+        hid::UpdateSonyFeedback();
+#endif
 #endif
 #if defined(LIBERTY_RECOMP_DISCORD_RPC)
         // Pump Discord callbacks ~once per second (every 1000 ms of 1ms sleeps)
@@ -1228,6 +1296,12 @@ int main(int argc, char *argv[])
     }
 
     StopLibertyWatchdog();
+#if defined(GTA4_TOUCH_LEGACY_HOST)
+    TouchHost::Shutdown();
+#endif
+#if defined(GTA4_SONY_LEGACY_OWNER)
+    hid::ShutdownSonyFeedback();
+#endif
     DIAG_EMIT("[Main] Main XThread finished\n");
 #if defined(LIBERTY_RECOMP_DISCORD_RPC)
     os::discord::Shutdown();

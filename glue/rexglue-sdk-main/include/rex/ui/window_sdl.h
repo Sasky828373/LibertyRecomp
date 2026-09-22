@@ -21,6 +21,7 @@
 #include <SDL3/SDL.h>
 
 #include <rex/ui/window.h>
+#include <rex/ui/paint_wakeup_state.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
 namespace rex::ui {
@@ -33,17 +34,20 @@ class WindowSDL final : public Window {
 
   void* GetNativeWindowHandle() const override;
   bool SetRelativeMouseMode(bool enabled) override;
+  bool GetPhysicalSafeArea(int32_t& x_out, int32_t& y_out, int32_t& width_out,
+                           int32_t& height_out) const override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
   void HandleKeyEvent(SDL_Event& event);
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
-#if REX_PLATFORM_MAC
+  void HandleTouchEvent(SDL_Event& event);
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   void HandleAcceleratedPointerMotion(float delta_x, float delta_y);
 #endif
   void HandleDropEvent(SDL_Event& event);
-  void HandlePaintEvent();
+  void HandlePaintEvent(uint32_t ticket);
 
   bool IsHDREnabled() const override;
   float GetSDRWhiteLevel() const override;
@@ -64,6 +68,9 @@ class WindowSDL final : public Window {
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
+  void RequestPaintAtUITickImpl() override;
+  void RequestPaintAfterImpl(uint32_t delay_ms) override;
+  void RequestPaintAfterNanosecondsImpl(uint64_t delay_ns) override;
 
  private:
   SDLWindowedAppContext& sdl_app_context() const {
@@ -76,20 +83,26 @@ class WindowSDL final : public Window {
   void PerformClose();
   void DestroySDLWindow();
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   static void AcceleratedPointerCallbackThunk(void* userdata, float delta_x, float delta_y);
+#endif
+#if REX_PLATFORM_MAC
   void DestroyMetalView();
   void* GetOrCreateMetalLayer();
 #endif
 
   void ApplyCursorVisibilityNow();
   void RearmCursorAutoHideTimer();
+  void RefreshPhysicalSafeArea();
 
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
-  std::atomic<bool> paint_pending_{false};
+  SDL_Rect physical_safe_area_{};
+  std::shared_ptr<PaintWakeupState> paint_wakeup_ = std::make_shared<PaintWakeupState>();
 #if REX_PLATFORM_MAC
   void* sdl_metal_view_ = nullptr;
+#endif
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   void* accelerated_pointer_monitor_ = nullptr;
 #endif
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cctype>
 #include <utility>
@@ -289,6 +290,7 @@ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsib
 }
 
 Presenter::~Presenter() {
+  CancelFramePacingWaits();
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
@@ -313,6 +315,34 @@ Presenter::~Presenter() {
   }
 }
 
+GuestOutputTransform Presenter::GetGuestOutputTransform() const {
+  std::lock_guard lock(guest_output_transform_mutex_);
+  return guest_output_transform_;
+}
+
+void Presenter::InvalidateGuestOutputTransform() const {
+  UpdateGuestOutputTransform({});
+}
+
+void Presenter::UpdateGuestOutputTransform(const GuestOutputTransform& transform) const {
+  std::lock_guard lock(guest_output_transform_mutex_);
+  const GuestOutputTransform& current = guest_output_transform_;
+  if (current.surface_width == transform.surface_width &&
+      current.surface_height == transform.surface_height &&
+      current.host_render_target_width == transform.host_render_target_width &&
+      current.host_render_target_height == transform.host_render_target_height &&
+      current.output_x == transform.output_x && current.output_y == transform.output_y &&
+      current.output_width == transform.output_width &&
+      current.output_height == transform.output_height &&
+      current.guest_width == transform.guest_width &&
+      current.guest_height == transform.guest_height) {
+    return;
+  }
+  const uint64_t next_revision = current.revision + 1;
+  guest_output_transform_ = transform;
+  guest_output_transform_.revision = next_revision;
+}
+
 void Presenter::SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface) {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
@@ -327,6 +357,8 @@ void Presenter::SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_su
     // SetPresenter > SetWindowSurfaceFromUIThread call).
     return;
   }
+
+  InvalidateGuestOutputTransform();
 
   // Disconnect from the current surface.
   if (surface_) {
@@ -402,6 +434,8 @@ void Presenter::OnSurfaceResizeFromUIThread() {
     return;
   }
 
+  InvalidateGuestOutputTransform();
+
   // Let the UI thread take ownership of painting (so the connection can be
   // updated) in a smooth way - downgrade to kUIThreadOnRequest rather than
   // kNone, because a forced repaint may not be necessary if, for example, the
@@ -429,6 +463,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   // OS (which will still be live even if the window goes outside any monitor).
   // But a surface check still won't cause harm, for simplicity.
   if (!InSurfaceOnMonitorFromUIThread()) {
+    frame_publication_gate_.SetAvailable(false);
     return;
   }
 
@@ -493,6 +528,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       WaitForUITickFromUIThread();
 
       paint_result = PaintAndPresent(draw_ui);
+      if (paint_result == PaintResult::kNotPresentedRetry) {
+        // Yield to the window event loop before retrying. This is essential on
+        // platforms where presentation progress may depend on that same loop.
+        request_repaint_at_tick = true;
+      }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -551,14 +591,17 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     }
   }
   if (request_repaint_at_tick || request_repaint_immediately) {
-    RequestPaintOrConnectionRecoveryViaWindow(request_repaint_immediately);
+    RequestPaintOrConnectionRecoveryViaWindow(
+        request_repaint_immediately,
+        request_repaint_at_tick && !request_repaint_immediately);
   }
 }
 
 bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
-    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+    std::function<bool(GuestOutputRefreshContext& context)> refresher,
+    GuestOutputProvenance provenance) {
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -566,13 +609,36 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  writable_properties.provenance = provenance;
+  // Selection originates in the callback that wrote THIS mailbox image, never
+  // from a global latest frame or from provenance attached before rendering.
+  writable_properties.provenance.frame_pixel_probe = {};
   bool is_active = writable_properties.IsActive();
   if (is_active) {
+    auto observed_refresher = [&](GuestOutputRefreshContext& context) {
+      context.SetFramePixelProbe({});
+      const bool updated = refresher(context);
+      writable_properties.provenance.frame_pixel_probe = PublishFramePixelProbe(
+          context.frame_pixel_probe(), updated, provenance.submitted_frame,
+          frontbuffer_width, frontbuffer_height);
+      return updated;
+    };
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
-                                frontbuffer_height, refresher, writable_properties.is_8bpc)) {
+                                frontbuffer_height, observed_refresher, writable_properties.is_8bpc)) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      if (provenance.diagnostic_trace) {
+        REXLOG_INFO(
+            "gta4-tv-mailbox-publish: session={} present={} frame={} origin={} "
+            "caller={:08X} published=false reason=refresh-failed writable={} "
+            "size={}x{} selected={:08X}@{} commands={}",
+            provenance.tv_session_id, provenance.title_present_id,
+            provenance.submitted_frame, provenance.present_origin,
+            provenance.guest_caller, guest_output_mailbox_writable_, frontbuffer_width,
+            frontbuffer_height, provenance.selected_texture,
+            provenance.selected_generation, provenance.native_command_count);
+      }
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -584,6 +650,12 @@ bool Presenter::RefreshGuestOutput(
     }
     guest_output_active_last_refresh_ = false;
   }
+
+  const uint64_t publication_serial = frame_publication_gate_.Publish(
+      is_active ? provenance.frame_rate_limit : 0);
+  writable_properties.provenance.publication_serial = publication_serial;
+  host_frame_rate_limit_.store(is_active ? provenance.frame_rate_limit : 0,
+                               std::memory_order_relaxed);
 
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
@@ -623,6 +695,25 @@ bool Presenter::RefreshGuestOutput(
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
 
+  if (provenance.diagnostic_trace) {
+    REXLOG_INFO(
+        "gta4-tv-mailbox-publish: session={} present={} frame={} origin={} caller={:08X} "
+        "published={} previous-state={:08X} previous-acquired={} previous-ready={} "
+        "next-writable={} active={} size={}x{} selected={:08X}@{} commands={}",
+        provenance.tv_session_id, provenance.title_present_id, provenance.submitted_frame,
+        provenance.present_origin, provenance.guest_caller, published_mailbox_index,
+        last_acquired_and_ready, last_acquired_and_ready & 3,
+        last_acquired_and_ready >> 2, guest_output_mailbox_writable_, is_active,
+        frontbuffer_width, frontbuffer_height, provenance.selected_texture,
+        provenance.selected_generation, provenance.native_command_count);
+  }
+
+  if (writable_properties.provenance.frame_pixel_probe.valid()) {
+    const auto& probe = writable_properties.provenance.frame_pixel_probe;
+    REXLOG_INFO("gta4-frame-pixel: point=mailbox-published run={} frame={} source={} present={} image={} version={} mailbox={} native-submission={}",
+                probe.run, probe.frame, probe.source_sequence, provenance.title_present_id,
+                probe.guest_image, probe.guest_version, published_mailbox_index, probe.native_submission);
+  }
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
   PaintMode paint_mode_snapshot = PaintMode::kNone;
@@ -661,7 +752,8 @@ bool Presenter::RefreshGuestOutput(
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
           paint_action = RefreshPaintAction::kGuestThreadPresented;
-          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+          if (paint_result == PaintResult::kNotPresentedRetry ||
+              surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
         } else {
@@ -742,6 +834,8 @@ bool Presenter::RefreshGuestOutput(
           return "presented_suboptimal";
         case PaintResult::kNotPresented:
           return "not_presented";
+        case PaintResult::kNotPresentedRetry:
+          return "not_presented_retry";
         case PaintResult::kNotPresentedConnectionOutdated:
           return "connection_outdated";
         case PaintResult::kGpuLostExternally:
@@ -760,6 +854,17 @@ bool Presenter::RefreshGuestOutput(
         connection_name(connection_state_after), action_name(paint_action),
         paint_result_name(paint_result));
   }
+  }
+  if (is_active && provenance.producer_backpressure && provenance.frame_rate_limit &&
+      std::this_thread::get_id() != ui_thread_id_ &&
+      paint_result != PaintResult::kGpuLostResponsible &&
+      paint_result != PaintResult::kGpuLostExternally) {
+    const uint64_t begin = FramePacerNowNs();
+    const bool accepted = frame_publication_gate_.Wait(publication_serial);
+    if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kPresenter)) {
+      REXLOG_INFO("FramePacer point=handoff serial={} frame={} released={} wait-ns={}",
+                  publication_serial, provenance.submitted_frame, accepted, FramePacerNowNs()-begin);
+    }
   }
   // Handle GPU loss when not in the middle of the function anymore, and
   // lifecycle management from the GPU loss callback is fine on the UI thread.
@@ -972,6 +1077,26 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   if (properties_out) {
     *properties_out = properties;
   }
+  static std::atomic<uint64_t> last_tv_mailbox_consume_present_id{0};
+  const bool log_tv_mailbox_consume =
+      properties.provenance.diagnostic_trace &&
+      last_tv_mailbox_consume_present_id.exchange(
+          properties.provenance.title_present_id, std::memory_order_relaxed) !=
+          properties.provenance.title_present_id;
+  if (log_tv_mailbox_consume) {
+    REXLOG_INFO(
+        "gta4-tv-mailbox-consume: session={} present={} frame={} origin={} caller={:08X} "
+        "old-state={:08X} desired-state={:08X} mailbox={} active={} size={}x{} "
+        "selected={:08X}@{} commands={}",
+        properties.provenance.tv_session_id, properties.provenance.title_present_id,
+        properties.provenance.submitted_frame, properties.provenance.present_origin,
+        properties.provenance.guest_caller, old_acquired_and_ready,
+        desired_acquired_and_ready, mailbox_index, properties.IsActive(),
+        properties.frontbuffer_width, properties.frontbuffer_height,
+        properties.provenance.selected_texture,
+        properties.provenance.selected_generation,
+        properties.provenance.native_command_count);
+  }
   return std::move(consumer_lock);
 }
 
@@ -995,6 +1120,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   // For safety such as division by zero prevention.
   if (!properties.IsActive() || !host_rt_width || !host_rt_height ||
       !surface_width_in_paint_connection_ || !surface_height_in_paint_connection_) {
+    InvalidateGuestOutputTransform();
     return flow;
   }
 
@@ -1141,6 +1267,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   }
   if (!output_width || !output_height || output_right <= 0 || output_bottom <= 0 ||
       flow.output_x >= int32_t(host_rt_width) || flow.output_y >= int32_t(host_rt_height)) {
+    InvalidateGuestOutputTransform();
     return flow;
   }
 
@@ -1384,6 +1511,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 
+  GuestOutputTransform input_transform;
+  input_transform.surface_width = surface_width_in_paint_connection_;
+  input_transform.surface_height = surface_height_in_paint_connection_;
+  input_transform.host_render_target_width = host_rt_width;
+  input_transform.host_render_target_height = host_rt_height;
+  input_transform.output_x = flow.output_x;
+  input_transform.output_y = flow.output_y;
+  input_transform.output_width = output_width;
+  input_transform.output_height = output_height;
+  input_transform.guest_width = properties.frontbuffer_width;
+  input_transform.guest_height = properties.frontbuffer_height;
+  UpdateGuestOutputTransform(input_transform);
+
   return flow;
 }
 
@@ -1416,6 +1556,7 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
 }
 
 void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
+  frame_publication_gate_.SetAvailable(new_mode != PaintMode::kNone);
   // Can be modified only from the UI thread, so can skip locking if it's the
   // same.
   if (paint_mode_ == new_mode) {
@@ -1455,6 +1596,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
 
 void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnectionState new_state) {
   assert_false(IsConnectedSurfacePaintConnectionState(new_state));
+  frame_publication_gate_.SetAvailable(false);
+  frame_pacer_.Reset();
   if (IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_)) {
     DisconnectPaintingFromSurfaceFromUIThreadImpl();
   }
@@ -1544,21 +1687,26 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   }
 }
 
-bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick) {
+bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick,
+                                                           bool defer_until_ui_tick) {
   // Can be called from any thread if an existing window_ is available in it,
   // and it's known to have a Surface that will be the same throughout this
   // call - not doing any checks whether this request can be satisfied
   // theoretically. For safety, check whether the window exists unconditionally.
   assert_not_null(window_);
   assert_not_null(surface_);
-  if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
-    // Invalidation pending already, no need to do it twice.
-    return false;
-  }
+  const bool already_requested = ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed);
+  if (already_requested && defer_until_ui_tick) return false;
+  // An immediate request may supersede a future timer. WindowSDL coalesces
+  // matching tickets; the pacer still rejects an attempt before its one deadline.
   if (force_ui_thread_paint_tick) {
     ForceUIThreadPaintTick();
   }
-  window_->RequestPaint();
+  if (defer_until_ui_tick) {
+    window_->RequestPaintAfterNanoseconds(paint_retry_delay_ns_.load(std::memory_order_relaxed));
+  } else {
+    window_->RequestPaint();
+  }
   return true;
 }
 
@@ -1635,7 +1783,29 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   SurfacePaintConnectionState connection_state_before = surface_paint_connection_state_;
+  const uint32_t fps = host_frame_rate_limit_.load(std::memory_order_relaxed);
+  frame_pacer_.Configure(fps, FramePacerNowNs());
+  PollPresentationTiming();
+  pacing_attempt_ = frame_pacer_.Plan(FramePacerNowNs());
+  if (pacing_attempt_.delay_ns) {
+    paint_retry_delay_ns_.store(pacing_attempt_.delay_ns, std::memory_order_relaxed);
+    return PaintResult::kNotPresentedRetry;
+  }
+  paint_retry_delay_ns_.store(1'000'000, std::memory_order_relaxed);
+  const uint64_t paint_begin_ns = FramePacerNowNs();
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    const uint64_t queue_end_ns = FramePacerNowNs();
+    frame_pacer_.Queued(queue_end_ns);
+    ++host_rate_trace_count_;
+    if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kPresenter)) {
+      REXLOG_INFO("FramePacer point=queued count={} fps={} slot-ns={} paint-begin-ns={} "
+                  "queue-end-ns={} display-target-host-ns={} ui={} missed-slots={}",
+                  host_rate_trace_count_, fps, pacing_attempt_.slot_ns, paint_begin_ns,
+                  queue_end_ns, pacing_attempt_.display_target_ns, execute_ui_drawers,
+                  frame_pacer_.missed_slots());
+    }
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
@@ -1699,6 +1869,8 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
           return "presented_suboptimal";
         case PaintResult::kNotPresented:
           return "not_presented";
+        case PaintResult::kNotPresentedRetry:
+          return "not_presented_retry";
         case PaintResult::kNotPresentedConnectionOutdated:
           return "connection_outdated";
         case PaintResult::kGpuLostExternally:
